@@ -3,6 +3,7 @@ from pathlib import Path
 import json
 import tomllib
 import yaml
+import glob
 
 import httpx
 from git import Repo, GitCommandError
@@ -15,7 +16,7 @@ from mkdocs.structure.nav import Navigation, Section, Link
 from mkdocs.structure.pages import Page
 from mkdocs.utils.templates import TemplateContext
 
-from pulp_docs.context import ctx_blog, ctx_docstrings, ctx_draft
+from pulp_docs.context import ctx_blog, ctx_docstrings, ctx_draft, find_paths
 
 log = get_plugin_logger(__name__)
 
@@ -33,6 +34,42 @@ class ComponentOption(Config):
     kind = config_options.Type(str)
     git_url = config_options.Type(str, default="")
     rest_api = config_options.Type(str, default="")
+
+    _resolved_location = None  # The repository parent directory on the fs
+
+    @property
+    def is_resolved(self):
+        return bool(self._resolved_location)
+
+    @property
+    def repository_name(self):
+        return self.path.split("/")[0]
+
+    def resolve_location(self, find_paths: list[str]):
+        expanded_paths = []
+        for dir in find_paths:
+            expanded_paths.extend(glob.glob(dir))
+        for dir in expanded_paths:
+            dir = Path(dir)
+            component_dir = dir.parent / self.path
+            if self.repository_name == dir.name and component_dir.exists():
+                self._resolved_location = dir.parent
+                return self._resolved_location
+        return None
+
+    def get_component_dir(self):
+        if not self.is_resolved:
+            raise RuntimeError(
+                "Can't get plugin path before resolving the dir in the filesystem."
+            )
+        return self._resolved_location / self.path
+
+    def get_git_dir(self):
+        if not self.is_resolved:
+            raise RuntimeError(
+                "Can't get git path before resolving the dir in the filesystem."
+            )
+        return self._resolved_location / self.repository_name
 
 
 class PulpDocsPluginConfig(Config):
@@ -234,13 +271,15 @@ class PulpDocsPlugin(BasePlugin[PulpDocsPluginConfig]):
 
         self.pulp_docs_dir = Path(config.docs_dir).parent
         self.repositories_dir = self.pulp_docs_dir.parent
+        self.find_paths = find_paths.get() or [f"{self.repositories_dir}/*"]
 
         mkdocstrings_config = config.plugins["mkdocstrings"].config
         components_var = []
         new_components = []
         for component in self.config.components:
-            component_dir = self.repositories_dir / component.path
-            if component_dir.exists():
+            found_location = component.resolve_location(self.find_paths)
+            if found_location:
+                component_dir = component.get_component_dir()
                 components_var.append(component_data(component, component_dir))
                 config.watch.append(str(component_dir / "docs"))
                 mkdocstrings_config.handlers["python"]["paths"].append(
@@ -253,6 +292,9 @@ class PulpDocsPlugin(BasePlugin[PulpDocsPluginConfig]):
                 else:
                     raise PluginError(f"Component '{component.title}' missing.")
         self.config.components = new_components
+        log.info(
+            f"Using components={[str(c.get_component_dir()) for c in new_components]}"
+        )
 
         macros_plugin = config.plugins["macros"]
         macros_plugin.register_macros({"rss_items": rss_items})
@@ -273,10 +315,10 @@ class PulpDocsPlugin(BasePlugin[PulpDocsPluginConfig]):
         user_nav: dict[str, t.Any] = {}
         dev_nav: dict[str, t.Any] = {}
         for component in self.config.components:
-            component_dir = self.repositories_dir / component.path
+            component_dir = component.get_component_dir()
 
             log.info(f"Fetching docs from '{component.title}'.")
-            git_repository_dir = self.repositories_dir / Path(component.path).parts[0]
+            git_repository_dir = component.get_git_dir()
             try:
                 git_branch = Repo(git_repository_dir).active_branch.name
             except TypeError:
@@ -290,7 +332,7 @@ class PulpDocsPlugin(BasePlugin[PulpDocsPluginConfig]):
             else:
                 component_docs_dir = component_dir / "docs"
             component_slug = Path(component_dir.name)
-            assert component_docs_dir.exists()
+            assert component_docs_dir.exists(), component_docs_dir
 
             component_nav = ComponentNav(config, component_slug)
 
