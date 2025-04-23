@@ -50,3 +50,6 @@ for command_name in ["build", "serve"]:
     draft_option(sub_command)
     blog_option(sub_command)
     docstrings_option(sub_command)
+    serve_options = sub_command.params
+    config_file_opt = next(filter(lambda opt: opt.name == "config_file", serve_options))
+    config_file_opt.envvar = "PULPDOCS_DIR"
